@@ -3,10 +3,10 @@ import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { leanEdit, StaleEditError } from "../src/edit-tool.ts";
+import { InvalidEditRangeError, leanEdit, StaleEditError, UnseenEditError } from "../src/edit-tool.ts";
 import { leanRead } from "../src/read-tool.ts";
 import { SnapshotStore } from "../src/snapshot-store.ts";
-
+import { withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 async function tempFile(content: string): Promise<{ dir: string; file: string }> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-lean-edit-"));
   const file = path.join(dir, "file.txt");
@@ -32,21 +32,21 @@ function readText(result: Awaited<ReturnType<typeof leanRead>>): string {
   return first?.type === "text" ? first.text : "";
 }
 
-async function expectStaleRefresh(run: () => Promise<unknown>): Promise<StaleEditError> {
+async function expectContextRefresh(run: () => Promise<unknown>): Promise<StaleEditError | UnseenEditError> {
   let caught: unknown;
   try {
     await run();
   } catch (error) {
     caught = error;
   }
-  assert.ok(caught instanceof StaleEditError);
+  assert.ok(caught instanceof StaleEditError || caught instanceof UnseenEditError);
   return caught;
 }
 
 test("edit without read returns current text and refreshes the snapshot", async () => {
   const session = await createSession("a\nb\n");
   const input = { path: session.file, startLine: 1, newText: "x" };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.message, "edit not applied: one or more requested ranges were not read beforehand.");
   assert.equal(error.refreshedText, "1 │ a\n2 │ b");
   await expectFile(session, "a\nb\n");
@@ -57,7 +57,7 @@ test("edit without read returns current text and refreshes the snapshot", async 
 test("failed line edit returns and snapshots five surrounding lines", async () => {
   const content = Array.from({ length: 15 }, (_, index) => String(index + 1)).join("\n") + "\n";
   const session = await createSession(content);
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, { path: session.file, startLine: 6, endLine: 7, newText: "six\nseven" }, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, { path: session.file, startLine: 6, endLine: 7, newText: "six\nseven" }, session.store));
   const expected = Array.from({ length: 12 }, (_, index) => `${index + 1} │ ${index + 1}`).join("\n");
   assert.equal(error.refreshedText, expected);
   assert.deepEqual(session.store.ranges(session.file), [{ startLine: 1, endLine: 12 }]);
@@ -70,12 +70,12 @@ test("failed line edit context clips to file boundaries", async () => {
   const content = Array.from({ length: 15 }, (_, index) => String(index + 1)).join("\n") + "\n";
 
   const atStart = await createSession(content);
-  const startError = await expectStaleRefresh(() => leanEdit(atStart.dir, { path: atStart.file, startLine: 2, newText: "two" }, atStart.store));
+  const startError = await expectContextRefresh(() => leanEdit(atStart.dir, { path: atStart.file, startLine: 2, newText: "two" }, atStart.store));
   assert.equal(startError.refreshedText, Array.from({ length: 7 }, (_, index) => `${index + 1} │ ${index + 1}`).join("\n"));
   assert.deepEqual(atStart.store.ranges(atStart.file), [{ startLine: 1, endLine: 7 }]);
 
   const atEnd = await createSession(content);
-  const endError = await expectStaleRefresh(() => leanEdit(atEnd.dir, { path: atEnd.file, startLine: 14, newText: "fourteen" }, atEnd.store));
+  const endError = await expectContextRefresh(() => leanEdit(atEnd.dir, { path: atEnd.file, startLine: 14, newText: "fourteen" }, atEnd.store));
   assert.equal(endError.refreshedText, Array.from({ length: 7 }, (_, index) => `${index + 9} │ ${index + 9}`).join("\n"));
   assert.deepEqual(atEnd.store.ranges(atEnd.file), [{ startLine: 9, endLine: 15 }]);
 });
@@ -83,7 +83,7 @@ test("failed line edit context clips to file boundaries", async () => {
 test("overlapping or touching failed-edit context windows merge without duplicate output", async () => {
   const content = Array.from({ length: 25 }, (_, index) => String(index + 1)).join("\n") + "\n";
   const session = await createSession(content);
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, {
+  const error = await expectContextRefresh(() => leanEdit(session.dir, {
     path: session.file,
     edits: [
       { startLine: 6, newText: "six" },
@@ -111,7 +111,7 @@ test("line context subsumes nearby column refresh without duplicate output", asy
       { startLine: 10, startColumn: 1, endColumn: 2, newText: "TEN" }
     ]
   };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, Array.from({ length: 11 }, (_, index) => `${index + 1} │ ${index + 1}`).join("\n"));
   assert.deepEqual(session.store.ranges(session.file), [{ startLine: 1, endLine: 11 }]);
   assert.deepEqual(session.store.columnRanges(session.file), []);
@@ -128,7 +128,7 @@ test("expanded failed-edit context exceeding limits creates no snapshot", async 
     const input = { path: session.file, startLine: 6, endLine: 7, newText: "six\nseven" };
     await assert.rejects(() => leanEdit(session.dir, input, session.store, { maxLines: 11, maxBytes: 50_000 }), /exceeds automatic refresh limits/);
     assert.deepEqual(session.store.ranges(session.file), []);
-    await assert.rejects(() => leanEdit(session.dir, input, session.store, config), StaleEditError);
+    await assert.rejects(() => leanEdit(session.dir, input, session.store, config), UnseenEditError);
   });
 
   await t.test("byte limit", async () => {
@@ -136,7 +136,7 @@ test("expanded failed-edit context exceeding limits creates no snapshot", async 
     const input = { path: session.file, startLine: 6, endLine: 7, newText: "six\nseven" };
     await assert.rejects(() => leanEdit(session.dir, input, session.store, { maxLines: 2000, maxBytes: 20 }), /exceeds automatic refresh limits/);
     assert.deepEqual(session.store.ranges(session.file), []);
-    await assert.rejects(() => leanEdit(session.dir, input, session.store, config), StaleEditError);
+    await assert.rejects(() => leanEdit(session.dir, input, session.store, config), UnseenEditError);
   });
 });
 
@@ -144,7 +144,7 @@ test("edit range not covered by memorized reads returns and refreshes that range
   const session = await createSession("a\nb\nc\n");
   await leanRead(session.dir, { path: session.file, ...{ offset: 1 }, limit: 1 }, config, session.store);
   const input = { path: session.file, startLine: 2, newText: "x" };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1 │ a\n2 │ b\n3 │ c");
   await leanEdit(session.dir, input, session.store);
   await expectFile(session, "a\nx\nc\n");
@@ -154,7 +154,7 @@ test("file changed after read returns current text and refreshes snapshot", asyn
   const session = await createSession("a\nb\n");
   await leanRead(session.dir, { path: session.file }, config, session.store);
   await fs.writeFile(session.file, "a\nB\n", "utf8");
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 2, newText: "x" } }, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 2, newText: "x" } }, session.store));
   assert.equal(error.message, "edit not applied: the requested text changed since it was read.");
   assert.equal(error.refreshedText, "1 │ a\n2 │ B");
   await expectFile(session, "a\nB\n");
@@ -168,7 +168,7 @@ test("stale refresh does not snapshot text beyond automatic output limits", asyn
   await fs.writeFile(session.file, "updated text\n", "utf8");
   const input = { path: session.file, startLine: 1, newText: "after" };
   await assert.rejects(() => leanEdit(session.dir, input, session.store, { maxLines: 1, maxBytes: 5 }), /exceeds automatic refresh limits/);
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1 │ updated text");
 });
 
@@ -185,17 +185,15 @@ test("concurrent stale edits cannot consume each other's refreshed snapshot", as
   await expectFile(session, "external\n");
 });
 
-test("same-process initially valid concurrent edits do not lose updates", async () => {
+test("same-process concurrent non-overlapping edits both apply after queueing", async () => {
   const session = await createSession("one\ntwo\n");
   await leanRead(session.dir, { path: session.file }, config, session.store);
   const results = await Promise.allSettled([
     leanEdit(session.dir, { path: session.file, startLine: 1, newText: "ONE" }, session.store),
     leanEdit(session.dir, { path: session.file, startLine: 2, newText: "TWO" }, session.store)
   ]);
-  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
-  assert.ok(results.some((result) => result.status === "rejected" && /snapshot changed while edit was queued/.test(String(result.reason))));
-  const content = await fs.readFile(session.file, "utf8");
-  assert.ok(content === "ONE\ntwo\n" || content === "one\nTWO\n");
+  assert.ok(results.every((result) => result.status === "fulfilled"));
+  await expectFile(session, "ONE\nTWO\n");
 });
 
 test("duplicate text edits only requested range", async () => {
@@ -235,13 +233,26 @@ test("successful line-count-changing edit invalidates later snapshots", async ()
   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 3, newText: "B" } }, session.store), StaleEditError);
 });
 
+test("line-count invalidation marks previously read lines below the edit as stale", async () => {
+  const session = await createSession("one\ntwo\nthree\nfour\n");
+  await leanRead(session.dir, { path: session.file, offset: 1, limit: 1 }, config, session.store);
+  await leanRead(session.dir, { path: session.file, offset: 3, limit: 2 }, config, session.store);
+
+  await leanEdit(session.dir, { path: session.file, startLine: 1, newText: "ONE\nONE-EXTRA" }, session.store);
+
+  await assert.rejects(
+    () => leanEdit(session.dir, { path: session.file, startLine: 3, newText: "THREE" }, session.store),
+    (error: unknown) => error instanceof StaleEditError && !(error instanceof UnseenEditError) && !(error instanceof InvalidEditRangeError)
+  );
+});
+
 test("successful same-line-count edit preserves unaffected later snapshots", async () => {
   const session = await createSession("1\n2\n3\n4\n");
   await leanRead(session.dir, { path: session.file }, config, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 2, newText: "TWO" } }, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 4, newText: "FOUR" } }, session.store);
   await expectFile(session, "1\nTWO\n3\nFOUR\n");
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 2, newText: "again" } }, session.store), StaleEditError);
+   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 2, newText: "again" } }, session.store), UnseenEditError);
 });
 
 test("edit can use combined read ranges from same file", async () => {
@@ -268,6 +279,47 @@ test("edit keeps memorized lines before edited range only", async () => {
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 2, newText: "TWO" } }, session.store);
   await expectFile(session, "1\nTWO\nthree-four\n5\n6\n");
   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 5, newText: "blocked" } }, session.store), StaleEditError);
+});
+
+test("queued same-file edits validate current content instead of failing on revision bookkeeping", async () => {
+  const session = await createSession("a\nb\nc\nd\ne\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+
+  let release!: () => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withFileMutationQueue(session.file, async () => { entered(); await gate; });
+  await ready;
+
+  const first = leanEdit(session.dir, { path: session.file, startLine: 2, newText: "B" }, session.store);
+  const second = leanEdit(session.dir, { path: session.file, startLine: 5, newText: "E" }, session.store);
+  release();
+  await Promise.all([holder, first, second]);
+  await expectFile(session, "a\nB\nc\nd\nE\n");
+});
+
+test("queued stale sibling receives refresh context and can retry without read", async () => {
+  const session = await createSession("a\nb\nc\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+
+  let release!: () => void;
+  let entered!: () => void;
+  const ready = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const holder = withFileMutationQueue(session.file, async () => { entered(); await gate; });
+  await ready;
+
+  const input = { path: session.file, startLine: 2, newText: "B" };
+  const first = leanEdit(session.dir, input, session.store);
+  const second = expectContextRefresh(() => leanEdit(session.dir, input, session.store));
+  release();
+  await first;
+  const stale = await second;
+  assert.equal(stale.refreshedText, "1 │ a\n2 │ B\n3 │ c");
+  await holder;
+  await leanEdit(session.dir, input, session.store);
+  await expectFile(session, "a\nB\nc\n");
 });
 
 test("multi-range edit applies non-overlapping ranges against original lines", async () => {
@@ -306,11 +358,25 @@ test("stale multi-range edit refreshes every requested range", async () => {
       { startLine: 5, newText: "five" }
     ]
   };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1 │ a\n2 │ B\n3 │ c\n4 │ d\n5 │ E");
   await leanEdit(session.dir, input, session.store);
   await expectFile(session, "a\ntwo\nc\nd\nfive\n");
 });
+test("stale range rejects a batch without partially applying earlier ranges", async () => {
+  const session = await createSession("a\nb\nc\nd\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+  await fs.writeFile(session.file, "a\nb\nCHANGED\nd\n", "utf8");
+  await assert.rejects(() => leanEdit(session.dir, {
+    path: session.file,
+    edits: [
+      { startLine: 1, newText: "A" },
+      { startLine: 3, newText: "C" }
+    ]
+  }, session.store), StaleEditError);
+  await expectFile(session, "a\nb\nCHANGED\nd\n");
+});
+
 test("same-line-count multi-range edit preserves unaffected later snapshots", async () => {
   const session = await createSession("1\n2\n3\n4\n5\n6\n");
   await leanRead(session.dir, { path: session.file }, config, session.store);
@@ -322,7 +388,7 @@ test("same-line-count multi-range edit preserves unaffected later snapshots", as
   } }, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 6, newText: "six" } }, session.store);
   await expectFile(session, "1\ntwo\n3\nfour\nfive\nsix\n");
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 4, newText: "again" } }, session.store), StaleEditError);
+  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 4, newText: "again" } }, session.store), UnseenEditError);
 });
 
 test("mixed multi-range edit invalidates later snapshots if any range changes line count", async () => {
@@ -356,7 +422,7 @@ test("same-line-count column edit preserves unaffected later snapshots on other 
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 4, newText: "XYZ" } }, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 3, newText: "THIRD" } }, session.store);
   await expectFile(session, "aXYZef\nsecond\nTHIRD\n");
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 4, newText: "QQQ" } }, session.store), StaleEditError);
+   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 4, newText: "QQQ" } }, session.store), UnseenEditError);
 });
 
 test("empty-string column edit preserves unaffected later snapshots", async () => {
@@ -365,7 +431,7 @@ test("empty-string column edit preserves unaffected later snapshots", async () =
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 4, newText: "" } }, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 3, newText: "THIRD" } }, session.store);
   await expectFile(session, "aef\nsecond\nTHIRD\n");
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 2, newText: "Q" } }, session.store), StaleEditError);
+   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 2, newText: "Q" } }, session.store), UnseenEditError);
 });
 
 test("same-line-count mixed full-line and empty-string column edit preserves unaffected later snapshots", async () => {
@@ -379,8 +445,8 @@ test("same-line-count mixed full-line and empty-string column edit preserves una
   } }, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 4, newText: "FOURTH" } }, session.store);
   await expectFile(session, "aef\nsecond\nTHIRD\nFOURTH\n");
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 2, newText: "Q" } }, session.store), StaleEditError);
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 3, newText: "again" } }, session.store), StaleEditError);
+   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 2, newText: "Q" } }, session.store), UnseenEditError);
+   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 3, newText: "again" } }, session.store), UnseenEditError);
 });
 
 test("same-line-count mixed batch preserves later column snapshots", async () => {
@@ -396,7 +462,7 @@ test("same-line-count mixed batch preserves later column snapshots", async () =>
   } }, session.store);
   await leanEdit(session.dir, { path: session.file, ...{ startLine: 3, startColumn: 6, endColumn: 7, newText: "xy" } }, session.store);
   await expectFile(session, `FIRST\nsond\n01234xy789ABCDEFGHIJ0123456789\n`);
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, newText: "again" } }, session.store), StaleEditError);
+   await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 1, newText: "again" } }, session.store), UnseenEditError);
 });
 
 test("line-count-changing mixed batch invalidates later column snapshots", async () => {
@@ -410,7 +476,7 @@ test("line-count-changing mixed batch invalidates later column snapshots", async
       { startLine: 2, startColumn: 2, endColumn: 3, newText: "" }
     ]
   } }, session.store);
-  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 3, startColumn: 6, endColumn: 7, newText: "xy" } }, session.store), /requested columns are beyond end of line/);
+  await assert.rejects(() => leanEdit(session.dir, { path: session.file, ...{ startLine: 3, startColumn: 6, endColumn: 7, newText: "xy" } }, session.store), StaleEditError);
 });
 
 test("multi-range edit rejects overlapping ranges", async () => {
@@ -470,7 +536,7 @@ test("huge line column edit returns an unread target span before retrying", asyn
   const session = await createSession(`${huge}\n`);
   await leanRead(session.dir, { path: session.file, ...{ offset: 1 }, columnOffset: 1, columnLimit: 4 }, { maxLines: 2000, maxBytes: 50, maxColumns: 4 }, session.store);
   const input = { path: session.file, startLine: 1, startColumn: 6, endColumn: 8, newText: "xyz" };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1:6-8 │ 567");
   await leanEdit(session.dir, input, session.store);
   await expectFile(session, "01234xyz89ABCDEFGHIJ\n");
@@ -482,7 +548,7 @@ test("stale huge-line column edit refreshes the target window", async () => {
   await leanRead(session.dir, { path: session.file, ...{ offset: 1 }, columnOffset: 5, columnLimit: 6 }, { maxLines: 2000, maxBytes: 20, maxColumns: 6 }, session.store);
   await fs.writeFile(session.file, "01234ZZZ89ABCDEFGHIJ\n", "utf8");
   const input = { path: session.file, ...{ startLine: 1, startColumn: 6, endColumn: 8, newText: "xyz" } };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1:6-8 │ ZZZ");
   await leanEdit(session.dir, input, session.store);
   await expectFile(session, "01234xyz89ABCDEFGHIJ\n");
@@ -511,7 +577,7 @@ test("column edit can insert new lines and refreshes invalidated later snapshots
   await leanRead(session.dir, { path: session.file }, config, session.store);
   await leanEdit(session.dir, { path: session.file, startLine: 1, startColumn: 2, endColumn: 4, newText: "X\nY" }, session.store);
   await expectFile(session, "aX\nYef\nsecond\nthird\n");
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, { path: session.file, startLine: 3, newText: "SECOND" }, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, { path: session.file, startLine: 3, newText: "SECOND" }, session.store));
   assert.equal(error.refreshedText, "1 │ aX\n2 │ Yef\n3 │ second\n4 │ third");
 });
 
@@ -520,7 +586,7 @@ test("stale normal-line column edit refreshes the whole line", async () => {
   await leanRead(session.dir, { path: session.file }, config, session.store);
   await fs.writeFile(session.file, "aBCDef\n", "utf8");
   const input = { path: session.file, ...{ startLine: 1, startColumn: 2, endColumn: 4, newText: "XYZ" } };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1 │ aBCDef");
   await leanEdit(session.dir, input, session.store);
   await expectFile(session, "aXYZef\n");
@@ -529,7 +595,7 @@ test("normal line column edit refreshes insufficient column coverage", async () 
   const session = await createSession("abcdef\n");
   await leanRead(session.dir, { path: session.file, ...{ offset: 1 }, columnOffset: 2, columnLimit: 3 }, { maxLines: 2000, maxBytes: 50, maxColumns: 3 }, session.store);
   const input = { path: session.file, startLine: 1, startColumn: 2, endColumn: 3, newText: "ZZ" };
-  const error = await expectStaleRefresh(() => leanEdit(session.dir, input, session.store));
+  const error = await expectContextRefresh(() => leanEdit(session.dir, input, session.store));
   assert.equal(error.refreshedText, "1:2-3 │ bc");
   await leanEdit(session.dir, input, session.store);
   await expectFile(session, "aZZdef\n");
@@ -593,7 +659,7 @@ test("read does not memorize partial first line as full-line snapshot", async ()
   assert.deepEqual(store.ranges(file), []);
   assert.deepEqual(store.columnRanges(file), [{ line: 1, startColumn: 1, endColumn: 1 }]);
   const input = { path: file, startLine: 1, newText: "changed" };
-  const error = await expectStaleRefresh(() => leanEdit(dir, input, store));
+  const error = await expectContextRefresh(() => leanEdit(dir, input, store));
   assert.equal(error.refreshedText, "1 │ abcdef\n2 │ next");
   await leanEdit(dir, input, store);
   assert.equal(await fs.readFile(file, "utf8"), "changed\nnext\n");
@@ -612,4 +678,55 @@ test("read and edit reject non-integer line arguments", async () => {
   await assert.rejects(() => leanRead(dir, { path: file, offset: 1.5 }, config, store), /offset must be an integer >= 1/);
   await leanRead(dir, { path: file }, config, store);
   await assert.rejects(() => leanEdit(dir, { path: file, startLine: 1.5, newText: "x" }, store), /startLine\/endLine must be integers/);
+});
+
+test("out-of-bounds columns are invalid and preserve the seen snapshot", async () => {
+  const session = await createSession("abcdef\nnext\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+  const rangesBefore = session.store.ranges(session.file);
+  await assert.rejects(
+    () => leanEdit(session.dir, { path: session.file, startLine: 1, startColumn: 1, endColumn: 399, newText: "x" }, session.store),
+    (error: unknown) => error instanceof InvalidEditRangeError && /line 1 length=6, requested columns 1-399/.test(error.message)
+  );
+  assert.deepEqual(session.store.ranges(session.file), rangesBefore);
+  await leanEdit(session.dir, { path: session.file, startLine: 1, newText: "changed" }, session.store);
+  await expectFile(session, "changed\nnext\n");
+});
+
+test("startColumn past end of line is invalid without clamping", async () => {
+  const session = await createSession("abcdef\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+  await assert.rejects(
+    () => leanEdit(session.dir, { path: session.file, startLine: 1, startColumn: 8, endColumn: 8, newText: "x" }, session.store),
+    /invalid edit range: line 1 length=6, requested columns 8-8/
+  );
+  await expectFile(session, "abcdef\n");
+});
+
+test("out-of-range and reversed coordinates are invalid edit ranges", async () => {
+  const session = await createSession("a\nb\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+  await assert.rejects(() => leanEdit(session.dir, { path: session.file, startLine: 3, newText: "c" }, session.store), /invalid edit range: line range 3 exceeds file length 2/);
+  await assert.rejects(() => leanEdit(session.dir, { path: session.file, startLine: 2, endLine: 1, newText: "x" }, session.store), /invalid edit range: endLine must be >= startLine/);
+  await assert.rejects(() => leanEdit(session.dir, { path: session.file, startLine: 1, startColumn: 2, endColumn: 1, newText: "x" }, session.store), /invalid edit range: endColumn must be >= startColumn/);
+});
+
+test("unseen range remains distinct from invalid and stale ranges", async () => {
+  const session = await createSession("a\nb\n");
+  const error = await expectContextRefresh(() => leanEdit(session.dir, { path: session.file, startLine: 2, newText: "B" }, session.store));
+  assert.ok(error instanceof UnseenEditError);
+  assert.doesNotMatch(error.message, /stale/i);
+});
+
+test("invalid member makes a batch fail before any write", async () => {
+  const session = await createSession("a\nb\nc\n");
+  await leanRead(session.dir, { path: session.file }, config, session.store);
+  await assert.rejects(() => leanEdit(session.dir, {
+    path: session.file,
+    edits: [
+      { startLine: 1, newText: "A" },
+      { startLine: 2, startColumn: 1, endColumn: 99, newText: "B" }
+    ]
+  }, session.store), /invalid edit range: line 2 length=1, requested columns 1-99/);
+  await expectFile(session, "a\nb\nc\n");
 });

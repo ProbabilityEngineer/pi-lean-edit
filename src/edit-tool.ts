@@ -85,21 +85,37 @@ export class StaleEditError extends Error {
   }
 }
 
+export class UnseenEditError extends Error {
+  readonly refreshedText: string;
+
+  constructor(refreshedText: string, reason = "one or more requested ranges were not read beforehand") {
+    super(`edit not applied: ${reason}.`);
+    this.name = "UnseenEditError";
+    this.refreshedText = refreshedText;
+  }
+}
+export class InvalidEditRangeError extends Error {
+  constructor(reason: string) {
+    super(`invalid edit range: ${reason}`);
+    this.name = "InvalidEditRangeError";
+  }
+}
+
 function validateRange(startLine: number, endLine: number): void {
-  if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) throw new Error("startLine/endLine must be integers");
-  if (startLine < 1 || endLine < 1) throw new Error("startLine/endLine must be >= 1");
-  if (endLine < startLine) throw new Error("endLine must be >= startLine");
+  if (!Number.isInteger(startLine) || !Number.isInteger(endLine)) throw new InvalidEditRangeError("startLine/endLine must be integers");
+  if (startLine < 1 || endLine < 1) throw new InvalidEditRangeError("startLine/endLine must be >= 1");
+  if (endLine < startLine) throw new InvalidEditRangeError("endLine must be >= startLine");
 }
 
 function validateColumns(edit: NormalizedEdit): void {
   const hasStart = edit.startColumn != null;
   const hasEnd = edit.endColumn != null;
-  if (hasStart !== hasEnd) throw new Error("startColumn and endColumn must be provided together");
+  if (hasStart !== hasEnd) throw new InvalidEditRangeError("startColumn and endColumn must be provided together");
   if (!hasStart) return;
-  if (edit.endLine !== edit.startLine) throw new Error("column edits must stay within one line");
-  if (!Number.isInteger(edit.startColumn) || !Number.isInteger(edit.endColumn)) throw new Error("startColumn/endColumn must be integers");
-  if (edit.startColumn! < 1 || edit.endColumn! < 1) throw new Error("startColumn/endColumn must be >= 1");
-  if (edit.endColumn! < edit.startColumn!) throw new Error("endColumn must be >= startColumn");
+  if (edit.endLine !== edit.startLine) throw new InvalidEditRangeError("column edits must stay within one line");
+  if (!Number.isInteger(edit.startColumn) || !Number.isInteger(edit.endColumn)) throw new InvalidEditRangeError("startColumn/endColumn must be integers");
+  if (edit.startColumn! < 1 || edit.endColumn! < 1) throw new InvalidEditRangeError("startColumn/endColumn must be >= 1");
+  if (edit.endColumn! < edit.startColumn!) throw new InvalidEditRangeError("endColumn must be >= startColumn");
 }
 
 function normalizeEdits(input: LeanEditInput): NormalizedEdit[] {
@@ -107,16 +123,16 @@ function normalizeEdits(input: LeanEditInput): NormalizedEdit[] {
   let rawEdits: UnvalidatedEditRange[];
   if (Array.isArray(unvalidated.edits)) {
     if ([unvalidated.startLine, unvalidated.endLine, unvalidated.startColumn, unvalidated.endColumn, unvalidated.newText].some((value) => value != null)) {
-      throw new Error("cannot combine top-level range fields with edits[]");
+      throw new InvalidEditRangeError("cannot combine top-level range fields with edits[]");
     }
     rawEdits = unvalidated.edits;
   } else {
-    if (unvalidated.startLine == null || unvalidated.newText == null) throw new Error("edit requires startLine and newText, or edits[]");
+    if (unvalidated.startLine == null || unvalidated.newText == null) throw new InvalidEditRangeError("edit requires startLine and newText, or edits[]");
     rawEdits = [unvalidated];
   }
-  if (rawEdits.length === 0) throw new Error("edits must contain at least one range");
+  if (rawEdits.length === 0) throw new InvalidEditRangeError("edits must contain at least one range");
   const edits = rawEdits.map((edit) => {
-    if (edit.startLine == null || edit.newText == null) throw new Error("each edit requires startLine and newText");
+    if (edit.startLine == null || edit.newText == null) throw new InvalidEditRangeError("each edit requires startLine and newText");
     const startLine = edit.startLine;
     const endLine = edit.endLine ?? edit.startLine;
     validateRange(startLine, endLine);
@@ -135,11 +151,11 @@ function normalizeEdits(input: LeanEditInput): NormalizedEdit[] {
     const prev = edits[i - 1]!;
     const cur = edits[i]!;
     if (prev.startLine === cur.startLine && (prev.startColumn != null || cur.startColumn != null)) {
-      if (prev.startColumn == null || cur.startColumn == null) throw new Error("cannot mix full-line and column edits on same line");
-      if (cur.startColumn <= prev.endColumn!) throw new Error("edit ranges must not overlap");
+      if (prev.startColumn == null || cur.startColumn == null) throw new InvalidEditRangeError("cannot mix full-line and column edits on same line");
+      if (cur.startColumn <= prev.endColumn!) throw new InvalidEditRangeError("edit ranges must not overlap");
       continue;
     }
-    if (cur.startLine <= prev.endLine) throw new Error("edit ranges must not overlap");
+    if (cur.startLine <= prev.endLine) throw new InvalidEditRangeError("edit ranges must not overlap");
   }
   return edits;
 }
@@ -279,15 +295,14 @@ export async function leanEdit(
   store: SnapshotStore = snapshotStore,
   config: LeanEditConfig = { maxLines: 2000, maxBytes: 50_000, maxColumns: 400 }
 ): Promise<LeanEditResult> {
-  const invocationRevision = store.revision();
   const edits = normalizeEdits(input);
   const full = await resolveCanonicalPath(cwd, input.path);
-  if (store.revision(full) > invocationRevision) throw new Error("file stale, read again: snapshot changed while edit was starting");
   const initialCoverages = edits.map((edit) => lookupCoverage(store, full, edit));
-  const initialRevision = store.revision(full);
 
   return withInterprocessFileMutationLock(full, () => withFileMutationQueue(full, async () => {
-    if (store.revision(full) !== initialRevision) throw new Error("file stale, read again: snapshot changed while edit was queued");
+    // Do not reject solely because another queued operation changed snapshot
+    // bookkeeping. Validate the captured ranges against the current file below;
+    // this lets unaffected sibling edits proceed and stale ones refresh context.
     const before = await fs.readFile(full, "utf8");
     const parsed = splitText(before);
     const parts: Array<{ oldText: string; edit: NormalizedEdit }> = [];
@@ -296,18 +311,30 @@ export async function leanEdit(
 
     for (let i = 0; i < edits.length; i++) {
       const edit = edits[i]!;
-      if (edit.endLine > parsed.lines.length) throw new Error("file stale, read again: requested range is beyond end of file");
       const coverage = initialCoverages[i];
+      const lineCountInvalidated = store.lineCountInvalidated(full, edit.startLine, edit.endLine);
+
+      if (edit.endLine > parsed.lines.length) {
+        if (coverage || lineCountInvalidated) changedCoverage = true;
+        else throw new InvalidEditRangeError(`line range ${rangeLabel(edit)} exceeds file length ${parsed.lines.length}`);
+        continue;
+      }
 
       if (edit.startColumn != null && edit.endColumn != null) {
         const line = parsed.lines[edit.startLine - 1]!;
-        if (edit.endColumn > codePointLength(line)) throw new Error("file stale, read again: requested columns are beyond end of line");
-        if (!coverage) missingCoverage = true;
-        else if (!coverageMatches(edit, coverage, line)) changedCoverage = true;
+        let rangeChanged = lineCountInvalidated;
+        if (lineCountInvalidated) changedCoverage = true;
+        else if (!coverage) missingCoverage = true;
+        else if (!coverageMatches(edit, coverage, line)) { changedCoverage = true; rangeChanged = true; }
+        if (edit.endColumn > codePointLength(line)) {
+          if (rangeChanged) continue;
+          throw new InvalidEditRangeError(`line ${edit.startLine} length=${codePointLength(line)}, requested columns ${edit.startColumn}-${edit.endColumn}`);
+        }
         parts.push({ oldText: sliceColumns(line, edit.startColumn, edit.endColumn), edit });
       } else {
         const actual = sliceRange(parsed.lines, edit.startLine, edit.endLine);
-        if (!coverage) missingCoverage = true;
+        if (lineCountInvalidated) changedCoverage = true;
+        else if (!coverage) missingCoverage = true;
         else if (coverage.kind !== "full-line" || !snapshotMatches(coverage.lines, actual)) changedCoverage = true;
         parts.push({ oldText: rangeText(parsed.lines, edit.startLine, edit.endLine, parsed.lineEnding), edit });
       }
@@ -315,13 +342,14 @@ export async function leanEdit(
 
     if (missingCoverage || changedCoverage) {
       const refreshedText = refreshStaleRanges(store, full, edits, initialCoverages, parsed, config);
-      if (refreshedText == null) throw new Error("file stale, read again: updated range exceeds automatic refresh limits");
-      const reason = missingCoverage && changedCoverage
-        ? "one or more requested ranges were not read beforehand, and other requested text changed since it was read"
-        : missingCoverage
-          ? "one or more requested ranges were not read beforehand"
+      if (refreshedText == null) throw new Error(`${changedCoverage ? "file stale" : "edit target unseen"}; fresh context exceeds automatic refresh limits`);
+      if (changedCoverage) {
+        const reason = missingCoverage
+          ? "one or more requested ranges were not read beforehand, and other requested text changed since it was read"
           : "the requested text changed since it was read";
-      throw new StaleEditError(refreshedText, reason);
+        throw new StaleEditError(refreshedText, reason);
+      }
+      throw new UnseenEditError(refreshedText);
     }
 
     const nextLines = [...parsed.lines];

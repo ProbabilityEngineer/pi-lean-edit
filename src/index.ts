@@ -3,7 +3,7 @@ import { dirname, join } from "node:path";
 import { createWriteToolDefinition, getAgentDir, getSettingsListTheme, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Container, SettingsList, Text, getCapabilities, getImageDimensions, imageFallback, type SettingItem } from "@earendil-works/pi-tui";
 import { leanRead, leanReadSchema, type LeanReadResult } from "./read-tool.ts";
-import { leanEdit, leanEditSchema, StaleEditError } from "./edit-tool.ts";
+import { leanEdit, leanEditSchema, InvalidEditRangeError, StaleEditError, UnseenEditError } from "./edit-tool.ts";
 import { failureDelta, formatLeanEditStats, LeanEditMetricsStore, type LeanEditDelta, type LeanEditMetricsSnapshot } from "./metrics.ts";
 import { diffStat } from "./diff.ts";
 import { renderDiffForLeanEdit } from "./diff-render.ts";
@@ -255,8 +255,8 @@ export default function (pi: ExtensionAPI) {
     promptGuidelines: [
       "edit: use after read for same file/ranges; if requested text was not read or has changed, edit returns the current text without applying; retry the same edit only if that text is what you meant to replace.",
       "edit: after success, edited ranges require another read or failed edit before reuse; line-count-preserving edits keep unaffected later reads valid.",
-      "edit: use edits[] for multiple non-overlapping ranges; do not combine top-level range fields with edits[]; newText: \"\" deletes.",
-      "edit: line ranges use startLine/endLine without columns; column ranges use startLine/startColumn/endColumn without endLine and may insert newlines; huge-line column edits require a matching column read."
+      "edit: use edits[] for multiple non-overlapping ranges; when making multiple changes to one file from the same read state, combine them in one edit call instead of issuing separate calls; do not combine top-level range fields with edits[]; newText: \"\" deletes.",
+      "edit: line ranges use startLine/endLine without columns; omit columns to replace a whole line; column ranges use startLine/startColumn/endColumn without endLine and may insert newlines; huge-line column edits require a matching column read."
     ],
     parameters: leanEditSchema,
     renderShell: "default",
@@ -272,9 +272,11 @@ export default function (pi: ExtensionAPI) {
       } catch (e) {
         const delta = failureDelta();
         const snapshot = await metrics.record(delta);
-        const msg = e instanceof StaleEditError
-          ? `${e.message}\nCurrent text:\n${e.refreshedText}\nIf this is the text you meant to replace, retry the same edit.`
-          : e instanceof Error ? e.message : String(e);
+        const msg = e instanceof InvalidEditRangeError
+          ? e.message
+          : e instanceof StaleEditError || e instanceof UnseenEditError
+            ? `${e.message}\nCurrent text:\n${e.refreshedText}\nIf this is the text you meant to replace, retry the same edit.`
+            : e instanceof Error ? e.message : String(e);
         throw new Error(`${msg}\n${statsLine(snapshot)}`);
       }
     },

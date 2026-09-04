@@ -46,11 +46,16 @@ ColumnRange & { path: string }
 { path: string; edits: Array<LineRange | ColumnRange> }
 ```
 
-`edit` applies one or more non-overlapping inclusive ranges only when the requested text matches text previously shown by `read` or a failed edit. Column ranges must stay within one source line, but their replacement text may contain newlines. If a range was not read or its text changed, the edit is not applied; for line-range edits, the error returns and snapshots the current target with up to five surrounding lines on each side so the same or a nearby corrected edit can be retried. Text beyond the configured automatic output limits still requires `read`. Normal-line column reads show the whole line; huge-line column reads can cover matching column ranges. After a successful edit, edited text must be read again before reuse. Line-count-preserving edits keep unaffected later reads valid; line-count-changing edits invalidate them.
+When making multiple non-overlapping changes to one file from the same read state, combine them in one `edit` call using `edits[]` rather than issuing separate calls. The batch validates every range before writing and applies ranges against the original line coordinates.
+
+`edit` applies one or more non-overlapping inclusive ranges only when the requested text matches text previously shown by `read` or a failed edit. Invalid coordinates (such as columns past the current line length) return a precise `invalid edit range` error without changing snapshot state; unseen targets remain distinct from stale content. If a range was not read or its text changed, the edit is not applied; for line-range edits, the error returns and snapshots the current target with up to five surrounding lines on each side so the same or a nearby corrected edit can be retried. Text beyond the configured automatic output limits still requires `read`. Normal-line column reads show the whole line; huge-line column reads can cover matching column ranges. After a successful edit, edited text must be read again before reuse. Line-count-preserving edits keep unaffected later reads valid; line-count-changing edits invalidate them.
+
+### Concurrency limitation
+
+Pi runs tool calls in parallel by default; `edit` serializes same-file mutation callbacks but has no extension API for identifying or cancelling sibling tool calls. Separate same-file calls therefore still validate independently. Batch related changes when possible; queued stale calls receive a small refreshed target context instead of requiring a full-file reread.
 
 ## Concurrency
-
-Cooperating `pi-lean-edit` processes in one checkout serialize `edit` and `write` mutations per canonical file; different files can still proceed concurrently. Snapshots remain per process, so every subagent must perform its own `read` before `edit`. For substantial parallel work, isolated worktrees or disjoint files are still preferable. Shell commands and other tools that do not use this cooperative lock can still race with these operations.
+Cooperating `pi-lean-edit` processes in one checkout serialize `edit` and `write` mutations per canonical file; different files can still proceed concurrently. Snapshots remain per process, so every subagent must perform its own `read` before `edit`. Shell commands and other tools that do not use this cooperative lock can still race with these operations.
 
 ## Metrics
 

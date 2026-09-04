@@ -114,10 +114,16 @@ function mergeAdjacentColumns(segments: ColumnSnapshotSegment[]): ColumnSnapshot
 
 export class SnapshotStore {
   private files = new Map<string, FileMemory>();
+  private lineCountInvalidations = new Map<string, number>();
   private nextRevision = 0;
 
   revision(path?: string): number {
     return path == null ? this.nextRevision : this.files.get(path)?.revision ?? 0;
+  }
+
+  lineCountInvalidated(path: string, startLine: number, endLine = startLine): boolean {
+    const firstInvalidLine = this.lineCountInvalidations.get(path);
+    return firstInvalidLine != null && endLine >= firstInvalidLine;
   }
 
   set(snapshot: FileSnapshot): void {
@@ -224,6 +230,9 @@ export class SnapshotStore {
   truncateAfter(path: string, lastLineToKeep: number): void {
     const memory = this.files.get(path);
     if (!memory) return;
+    const firstInvalidLine = lastLineToKeep + 1;
+    const previousInvalidation = this.lineCountInvalidations.get(path);
+    this.lineCountInvalidations.set(path, previousInvalidation == null ? firstInvalidLine : Math.min(previousInvalidation, firstInvalidLine));
     const next: SnapshotSegment[] = [];
     for (const segment of memory.segments) {
       if (segment.startLine > lastLineToKeep) continue;
@@ -241,6 +250,7 @@ export class SnapshotStore {
 
   clear(): void {
     this.files.clear();
+    this.lineCountInvalidations.clear();
   }
 
   covered(path: string, startLine: number, endLine: number): FileSnapshot | undefined {

@@ -64,3 +64,10 @@ test("registered edit execute throws with stale guidance and recorded metrics", 
   assert.equal(metrics.attempts, 1);
   assert.equal(metrics.failures, 1);
 });
+
+test("edit guidance prefers batching same-file changes", async () => {
+  const dir = await tempDir();
+  const tools = registerTools(path.join(dir, "metrics.json"));
+  const editTool = tools.get("edit");
+  assert.ok(editTool.promptGuidelines.some((guideline: string) => guideline.includes("multiple changes to one file") && guideline.includes("one edit call")));
+});

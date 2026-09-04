@@ -7,3 +7,4 @@ node_modules/
 # Lean-edit metrics when PI_LEAN_EDIT_METRICS_PATH points inside repo
 metrics.json
 metrics.json.*.tmp
+.turnlog/
